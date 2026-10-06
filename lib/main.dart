@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 
 void main() async {
@@ -51,6 +52,9 @@ class _InitialMoneyDialogState extends State<InitialMoneyDialog> {
               border: OutlineInputBorder(),
             ),
             keyboardType: TextInputType.number,
+            inputFormatters: [
+              FilteringTextInputFormatter.digitsOnly,
+            ],
           ),
           const SizedBox(height: 20.0),
           OutlinedButton(
@@ -382,6 +386,9 @@ class _InputPageState extends State<InputPage> {
                       border: OutlineInputBorder(),
                     ),
                     keyboardType: TextInputType.number,
+                    inputFormatters: [
+                      FilteringTextInputFormatter.digitsOnly,
+                    ],
                   ),
                 ),
                 const SizedBox(height: 30.0),
