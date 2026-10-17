@@ -1,25 +1,82 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:hive_flutter/hive_flutter.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Supabaseの初期化（ご自身のURLとAnon Keyに書き換えてください）
+  await Supabase.initialize(
+    url: 'https://yplhslkjnqozlgcdqjta.supabase.co',
+    publishableKey: 'sb_publishable_IOtdC3lGOsfAY5puP6xqVg_nzs5oKy3',
+  );
+
+  // Hiveの初期化（過去データの移行元として使用）
   await Hive.initFlutter();
   await Hive.openBox('expenseBox');
   await Hive.openBox('initialMoneyBox');
+
+  // 起動時にHiveからSupabaseへデータ移行を実行
+  await migrateHiveToSupabase();
+
   runApp(const MyApp());
 }
 
-final myBox = Hive.box('expenseBox');
-final initialMoneyBox = Hive.box('initialMoneyBox');
+// HiveからSupabaseへデータを移行する関数
+Future<void> migrateHiveToSupabase() async {
+  final expenseBox = Hive.box('expenseBox');
+  final initialMoneyBox = Hive.box('initialMoneyBox');
 
-void saveData(DateTime date, int amount, String category) {
-  final expense = {
+  // 1. 収支データの移行
+  if (expenseBox.isNotEmpty) {
+    final records = expenseBox.values.whereType<Map>().cast<Map>().toList();
+    for (var item in records) {
+      try {
+        await Supabase.instance.client.from('expenses').insert({
+          'date': item['date'],
+          'amount': item['amount'],
+          'category': item['category'],
+        });
+      } catch (e) {
+        // すでに移行済みなどのエラーはスキップ
+        debugPrint('Migration error (expense): $e');
+      }
+    }
+    // 移行が終わったらローカルのHiveを空にする（重複を防ぐため）
+    await expenseBox.clear();
+  }
+
+  // 2. 初期金額の移行
+  if (initialMoneyBox.containsKey('initialMoney') && !initialMoneyBox.get('migratedToSupabase', defaultValue: false)) {
+    final initialMoney = initialMoneyBox.get('initialMoney');
+    final initialDate = initialMoneyBox.get('initialDate');
+
+    try {
+      await Supabase.instance.client.from('settings').upsert({
+        'key': 'initialMoney',
+        'value': initialMoney.toString(),
+      });
+      await Supabase.instance.client.from('settings').upsert({
+        'key': 'initialDate',
+        'value': initialDate.toString(),
+      });
+
+      // 移行完了フラグを立てる
+      await initialMoneyBox.put('migratedToSupabase', true);
+    } catch (e) {
+      debugPrint('Migration error (settings): $e');
+    }
+  }
+}
+
+// Supabaseにデータを保存する関数
+Future<void> saveData(DateTime date, int amount, String category) async {
+  await Supabase.instance.client.from('expenses').insert({
     'date': date.toIso8601String(),
     'amount': amount,
     'category': category,
-  };
-  myBox.add(expense);
+  });
 }
 
 class InitialMoneyDialog extends StatefulWidget {
@@ -42,7 +99,8 @@ class _InitialMoneyDialogState extends State<InitialMoneyDialog> {
   Widget build(BuildContext context) {
     return AlertDialog(
       title: const Text('初期金額を入力してください'),
-      content:Column(
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
         mainAxisAlignment: MainAxisAlignment.center, 
         children: [
           TextField(
@@ -58,17 +116,28 @@ class _InitialMoneyDialogState extends State<InitialMoneyDialog> {
           ),
           const SizedBox(height: 20.0),
           OutlinedButton(
-            onPressed: () {
+            onPressed: () async {
               final initialMoney = int.tryParse(_initialMoneyController.text) ?? 0;
-              initialMoneyBox.put('initialMoney', initialMoney);
-              initialMoneyBox.put('initialDate', DateTime.now().toIso8601String());
-              Navigator.of(context).pop();
-              setState(() {});
+              final initialDate = DateTime.now().toIso8601String();
+
+              // Supabaseのsettingsテーブルに保存
+              await Supabase.instance.client.from('settings').upsert({
+                'key': 'initialMoney',
+                'value': initialMoney.toString(),
+              });
+              await Supabase.instance.client.from('settings').upsert({
+                'key': 'initialDate',
+                'value': initialDate,
+              });
+
+              if (context.mounted) {
+                Navigator.of(context).pop();
+              }
             },
             child: const Text('保存'),
           ),
         ],
-      )
+      ),
     );
   }
 }
@@ -118,7 +187,7 @@ class MyApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return  MaterialApp(
+    return MaterialApp(
       home: const MainPage(),
       theme: ThemeData(
         scaffoldBackgroundColor: Colors.white,
@@ -131,8 +200,8 @@ class MyApp extends StatelessWidget {
           style: OutlinedButton.styleFrom(
             foregroundColor: Colors.black,
             backgroundColor: Colors.white,
-            side: BorderSide(
-              color: const Color.fromARGB(255, 139, 203, 255),
+            side: const BorderSide(
+              color: Color.fromARGB(255, 139, 203, 255),
               width: 2.0,
             ),
             shape: RoundedRectangleBorder(
@@ -173,14 +242,21 @@ class _MainPageState extends State<MainPage> {
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!initialMoneyBox.containsKey('initialMoney')) {
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      // Supabaseから初期金額が設定されているか確認
+      final response = await Supabase.instance.client
+          .from('settings')
+          .select()
+          .eq('key', 'initialMoney')
+          .maybeSingle();
+
+      if (response == null && mounted) {
         showDialog(
           context: context,
           barrierDismissible: false,
           builder: (BuildContext context) {
             return const InitialMoneyDialog();
-          }
+          },
         );
       }
     });
@@ -207,7 +283,7 @@ class _MainPageState extends State<MainPage> {
         currentIndex: _selectedIndex,
         selectedItemColor: Colors.blue,
         onTap: _onItemTapped,
-      )
+      ),
     );
   }
 }
@@ -220,104 +296,143 @@ class RecordPage extends StatefulWidget {
 }
 
 class _RecordPageState extends State<RecordPage> {
+  // Supabaseからデータを取得するためのFutureメソッド
+  Future<Map<String, dynamic>> _fetchData() async {
+    final expensesResponse = await Supabase.instance.client
+        .from('expenses')
+        .select()
+        .order('date', ascending: false);
+
+    final settingsResponse = await Supabase.instance.client
+        .from('settings')
+        .select();
+
+    int initialMoney = 0;
+    String initialDate = '';
+
+    for (var item in settingsResponse) {
+      if (item['key'] == 'initialMoney') {
+        initialMoney = int.tryParse(item['value'].toString()) ?? 0;
+      } else if (item['key'] == 'initialDate') {
+        initialDate = item['value'].toString().split('T')[0];
+      }
+    }
+
+    return {
+      'expenses': expensesResponse,
+      'initialMoney': initialMoney,
+      'initialDate': initialDate,
+    };
+  }
 
   @override
   Widget build(BuildContext context) {
+    return FutureBuilder<Map<String, dynamic>>(
+      future: _fetchData(),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        if (snapshot.hasError) {
+          return Center(child: Text('エラーが発生しました: ${snapshot.error}'));
+        }
 
-    final DateTime now = DateTime.now();
-    final int currentYear = now.year;
-    final int currentMonth = now.month;
+        final data = snapshot.data ?? {};
+        final records = (data['expenses'] as List?)?.cast<Map<String, dynamic>>() ?? [];
+        final int initialMoney = data['initialMoney'] ?? 0;
+        final String initialDate = data['initialDate'] ?? '';
 
-    final records = myBox.values.whereType<Map>().cast<Map>().toList();
-    final thisYearRecords = records.where((item) {
-      final date = DateTime.parse(item['date']);
-      return date.year == currentYear;
-    }).toList();
-    final thisMonthRecords = thisYearRecords.where((item) {
-      final date = DateTime.parse(item['date']);
-      return date.month == currentMonth;
-    }).toList();
+        final DateTime now = DateTime.now();
+        final int currentYear = now.year;
+        final int currentMonth = now.month;
 
-    final int initialMoney = (initialMoneyBox.get('initialMoney') as int?) ?? 0;
-    final String initialDate = ((initialMoneyBox.get('initialDate') as String?) ?? '').split('T')[0];
+        final thisYearRecords = records.where((item) {
+          final date = DateTime.parse(item['date']);
+          return date.year == currentYear;
+        }).toList();
 
-    final int totalBalance = records.fold(0, (sum, item) {
-      final amount = item['amount'];
-      if (amount is int) {
-        return sum + amount;
-      }
-      return sum;
-    });
-    final int thisYearBalance = thisYearRecords.fold(0, (sum, item) {
-      final amount = item['amount'];
-      if (amount is int) {
-        return sum + amount;
-      }
-      return sum;
-    });
-    final int thisMonthBalance = thisMonthRecords.fold(0, (sum, item) {
-      final amount = item['amount'];
-      if (amount is int) {
-        return sum + amount;
-      }
-      return sum;
-    });
+        final thisMonthRecords = thisYearRecords.where((item) {
+          final date = DateTime.parse(item['date']);
+          return date.month == currentMonth;
+        }).toList();
 
-    final int sum = totalBalance + initialMoney;
+        final int totalBalance = records.fold(0, (sum, item) {
+          final amount = item['amount'];
+          if (amount is int) return sum + amount;
+          if (amount is num) return sum + amount.toInt();
+          return sum;
+        });
 
-    return SingleChildScrollView(
-      physics: const AlwaysScrollableScrollPhysics(),
-      child: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            const SizedBox(height: 30.0),
-            Text('合計：$sum'),
-            const SizedBox(height: 15.0),
-            Text('収支($initialDate～合計)：$totalBalance'),
-            const SizedBox(height: 10.0),
-            Text('収支(今年)：$thisYearBalance'),
-            const SizedBox(height: 10.0),
-            Text('収支(今月)：$thisMonthBalance'),
-            const SizedBox(height: 30.0),
-            ValueListenableBuilder(
-              valueListenable: myBox.listenable(),
-              builder: (context, Box box, _) {
-                if (box.isEmpty) {
-                  return const Text('記録がありません');
-                }
-                return SingleChildScrollView(
-                  scrollDirection: Axis.vertical,
-                  child: SingleChildScrollView(
-                    scrollDirection: Axis.horizontal,
-                    child: DataTable(
-                      columns: const [
-                        DataColumn(label: Text('日付')),
-                        DataColumn(label: Text('金額')),
-                        DataColumn(label: Text('カテゴリ')),
-                      ],
-                      rows: List<DataRow>.generate(
-                        box.length,
-                        (index) {
-                          final expense = box.getAt(box.length - 1 -index) as Map;
-                          return DataRow(
-                            cells: [
-                              DataCell(Text(expense['date'].toString().split('T')[0])),
-                              DataCell(Text(expense['amount'].toString())),
-                              DataCell(Text(expense['category'].toString())),
-                            ],
-                          );
-                        },
-                      ),
-                    ),
-                  ),
-                );
-              }
+        final int thisYearBalance = thisYearRecords.fold(0, (sum, item) {
+          final amount = item['amount'];
+          if (amount is int) return sum + amount;
+          if (amount is num) return sum + amount.toInt();
+          return sum;
+        });
+
+        final int thisMonthBalance = thisMonthRecords.fold(0, (sum, item) {
+          final amount = item['amount'];
+          if (amount is int) return sum + amount;
+          if (amount is num) return sum + amount.toInt();
+          return sum;
+        });
+
+        final int sum = totalBalance + initialMoney;
+
+        return RefreshIndicator(
+          onRefresh: () async {
+            setState(() {});
+          },
+          child: SingleChildScrollView(
+            physics: const AlwaysScrollableScrollPhysics(),
+            child: Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const SizedBox(height: 30.0),
+                  Text('合計：$sum'),
+                  const SizedBox(height: 15.0),
+                  Text('収支($initialDate～合計)：$totalBalance'),
+                  const SizedBox(height: 10.0),
+                  Text('収支(今年)：$thisYearBalance'),
+                  const SizedBox(height: 10.0),
+                  Text('収支(今月)：$thisMonthBalance'),
+                  const SizedBox(height: 30.0),
+                  records.isEmpty
+                      ? const Text('記録がありません')
+                      : SingleChildScrollView(
+                          scrollDirection: Axis.vertical,
+                          child: SingleChildScrollView(
+                            scrollDirection: Axis.horizontal,
+                            child: DataTable(
+                              columns: const [
+                                DataColumn(label: Text('日付')),
+                                DataColumn(label: Text('金額')),
+                                DataColumn(label: Text('カテゴリ')),
+                              ],
+                              rows: List<DataRow>.generate(
+                                records.length,
+                                (index) {
+                                  final expense = records[index];
+                                  return DataRow(
+                                    cells: [
+                                      DataCell(Text(expense['date'].toString().split('T')[0])),
+                                      DataCell(Text(expense['amount'].toString())),
+                                      DataCell(Text(expense['category'].toString())),
+                                    ],
+                                  );
+                                },
+                              ),
+                            ),
+                          ),
+                        ),
+                  const SizedBox(height: 30.0),
+                ],
+              ),
             ),
-            const SizedBox(height: 30.0)
-          ]
-        ),
-      ),
+          ),
+        );
+      },
     );
   }
 }
@@ -330,7 +445,6 @@ class InputPage extends StatefulWidget {
 }
 
 class _InputPageState extends State<InputPage> {
-
   String _sign = '+';
 
   final TextEditingController _amountController = TextEditingController();
@@ -342,7 +456,7 @@ class _InputPageState extends State<InputPage> {
     _categoryController.dispose();
     super.dispose();
   }
-  
+
   @override
   Widget build(BuildContext context) {
     return LayoutBuilder(builder: (context, constraints) {
@@ -404,21 +518,28 @@ class _InputPageState extends State<InputPage> {
                 ),
                 const SizedBox(height: 30.0),
                 ElevatedButton(
-                  onPressed: () {
-                    final amount = _sign == '+' ? int.parse(_amountController.text) : -int.parse(_amountController.text);
-                    saveData(selectedDate, amount, _categoryController.text);
+                  onPressed: () async {
+                    final rawAmount = int.tryParse(_amountController.text) ?? 0;
+                    final amount = _sign == '+' ? rawAmount : -rawAmount;
+                    
+                    // Supabaseに保存
+                    await saveData(selectedDate, amount, _categoryController.text);
+
                     setState(() {
                       selectedDate = DateTime.now();
                       _amountController.clear();
                       _categoryController.clear();
                     });
+
+                    // 画面を再描画するため、親ウィジェット（MainPageやRecordPage）へ通知するか、
+                    // 必要に応じてStatefulな構成を調整してください。
                   },
                   child: const Text('保存'),
                 ),
               ],
             ),
           ),
-        )
+        ),
       );
     });
   }
